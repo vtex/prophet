@@ -47,6 +47,7 @@ class Prophet(object):
         the first 80 percent of the history.
     yearly_seasonality: Fit yearly seasonality. Can be 'auto', True, or False.
     weekly_seasonality: Fit weekly seasonality. Can be 'auto', True, or False.
+    daily_seasonality: Fit daily seasonality. Can be 'auto', True, or False.
     holidays: pd.DataFrame with columns holiday (string) and ds (date type)
         and optionally columns lower_window and upper_window which specify a
         range of days around the date to be included as holidays.
@@ -78,6 +79,7 @@ class Prophet(object):
             n_changepoints=25,
             yearly_seasonality='auto',
             weekly_seasonality='auto',
+            daily_seasonality=False,
             holidays=None,
             seasonality_prior_scale=10.0,
             holidays_prior_scale=10.0,
@@ -96,6 +98,7 @@ class Prophet(object):
 
         self.yearly_seasonality = yearly_seasonality
         self.weekly_seasonality = weekly_seasonality
+        self.daily_seasonality = daily_seasonality
 
         if holidays is not None:
             if not (
@@ -146,8 +149,8 @@ class Prophet(object):
             for h in self.holidays['holiday'].unique():
                 if '_delim_' in h:
                     raise ValueError('Holiday name cannot contain "_delim_"')
-                if h in ['zeros', 'yearly', 'weekly', 'yhat', 'seasonal',
-                         'trend']:
+                if h in ['zeros', 'yearly', 'weekly', 'daily', 'yhat',
+                         'seasonal', 'trend']:
                     raise ValueError('Holiday name {} reserved.'.format(h))
 
     def setup_dataframe(self, df, initialize_scales=False):
@@ -249,8 +252,7 @@ class Prophet(object):
         # convert to days since epoch
         t = np.array(
             (dates - pd.datetime(1970, 1, 1))
-            .dt.days
-            .astype(np.float)
+            .dt.total_seconds()/(24*3600)
         )
         return np.column_stack([
             fun((2.0 * (i + 1) * np.pi * t / period))
@@ -296,8 +298,6 @@ class Prophet(object):
         scale_ratio = self.holidays_prior_scale / self.seasonality_prior_scale
         # Holds columns of our future matrix.
         expanded_holidays = defaultdict(lambda: np.zeros(dates.shape[0]))
-        # Makes an index so we can perform `get_loc` below.
-        row_index = pd.DatetimeIndex(dates)
 
         for _ix, row in self.holidays.iterrows():
             dt = row.ds.date()
@@ -309,21 +309,14 @@ class Prophet(object):
                 uw = 0
             for offset in range(lw, uw + 1):
                 occurrence = dt + timedelta(days=offset)
-                try:
-                    loc = row_index.get_loc(occurrence)
-                except KeyError:
-                    loc = None
+                loc = dates[dates.dt.date == occurrence].index
 
                 key = '{}_delim_{}{}'.format(
                     row.holiday,
                     '+' if offset >= 0 else '-',
                     abs(offset)
                 )
-                if loc is not None:
-                    expanded_holidays[key][loc] = scale_ratio
-                else:
-                    # Access key to generate value
-                    expanded_holidays[key]
+                expanded_holidays[key][loc] = scale_ratio
 
         # This relies pretty importantly on pandas keeping the columns in order.
         return pd.DataFrame(expanded_holidays)
@@ -359,6 +352,14 @@ class Prophet(object):
                 7,
                 3,
                 'weekly',
+            ))
+
+        if self.daily_seasonality:
+            seasonal_features.append(self.make_seasonality_features(
+                df['ds'],
+                1,
+                5,
+                'daily',
             ))
 
         if self.holidays is not None:
@@ -899,8 +900,8 @@ class Prophet(object):
                         weekly_start=0, yearly_start=0):
         """Plot the Prophet forecast components.
 
-        Will plot whichever are available of: trend, holidays, weekly
-        seasonality, and yearly seasonality.
+        Will plot whichever are available of: trend, holidays, daily
+        seasonality, weekly seasonality, and yearly seasonality.
 
         Parameters
         ----------
@@ -922,6 +923,7 @@ class Prophet(object):
         # Identify components to be plotted
         components = [('trend', True),
                       ('holidays', self.holidays is not None),
+                      ('daily', 'daily' in fcst),
                       ('weekly', 'weekly' in fcst),
                       ('yearly', 'yearly' in fcst)]
         components = [plot for plot, cond in components if cond]
@@ -936,6 +938,9 @@ class Prophet(object):
                     fcst, ax=ax, uncertainty=uncertainty, plot_cap=plot_cap)
             elif plot == 'holidays':
                 self.plot_holidays(fcst, ax=ax, uncertainty=uncertainty)
+            elif plot == 'daily':
+                self.plot_daily(
+                    ax=ax, uncertainty=uncertainty)
             elif plot == 'weekly':
                 self.plot_weekly(
                     ax=ax, uncertainty=uncertainty, weekly_start=weekly_start)
@@ -1013,6 +1018,40 @@ class Prophet(object):
         ax.grid(True, which='major', c='gray', ls='-', lw=1, alpha=0.2)
         ax.set_xlabel('ds')
         ax.set_ylabel('holidays')
+        return artists
+
+    def plot_daily(self, ax=None, uncertainty=True):
+        """Plot the daily component of the forecast.
+
+        Parameters
+        ----------
+        ax: Optional matplotlib Axes to plot on. One will be created if
+            this is not provided.
+        uncertainty: Optional boolean to plot uncertainty intervals.
+
+        Returns
+        -------
+        a list of matplotlib artists
+        """
+        artists = []
+        if not ax:
+            fig = plt.figure(facecolor='w', figsize=(10, 6))
+            ax = fig.add_subplot(111)
+        # Compute daily seasonality for a 24h sequence of hours
+        hours = pd.date_range(start='2017-01-01', periods=24, freq='1h')
+        df_d = pd.DataFrame({'ds': hours})
+        df_d = self.setup_dataframe(df_d)
+        seas = self.predict_seasonal_components(df_d)
+        hours = hours.hour
+        artists += ax.plot(hours, seas['daily'], ls='-', c='#0072B2')
+        if uncertainty:
+            artists += [ax.fill_between(
+                hours, seas['daily_lower'], seas['daily_upper'],
+                color='#0072B2', alpha=0.2)]
+        ax.grid(True, which='major', c='gray', ls='-', lw=1, alpha=0.2)
+        ax.set_xticks(hours)
+        ax.set_xlabel('Hour of day')
+        ax.set_ylabel('daily')
         return artists
 
     def plot_weekly(self, ax=None, uncertainty=True, weekly_start=0):
